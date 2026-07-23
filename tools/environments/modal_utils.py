@@ -79,7 +79,18 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
         *,
         timeout: int | None = None,
         stdin_data: str | None = None,
+        rewrite_compound_background: bool = True,
+        bounded_capture: bool = False,
     ) -> dict:
+        # Managed/remote modal transports execute commands via explicit transport
+        # and do not rely on shell background rewriters. Keep parameter for
+        # compatibility with BaseEnvironment callers.
+        _ = rewrite_compound_background
+        # bounded_capture: accepted for BaseEnvironment.execute() signature
+        # parity (the terminal tool passes it). Modal transports return the
+        # remote function's result in one payload, so streaming-time bounding
+        # does not apply; the terminal tool's final truncation still caps it.
+        _ = bounded_capture
         self._before_execute()
         prepared = self._prepare_modal_exec(
             command,
@@ -105,6 +116,12 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
         if self._client_timeout_grace_seconds is not None:
             deadline = time.monotonic() + prepared.timeout + self._client_timeout_grace_seconds
 
+        _now = time.monotonic()
+        _activity_state = {
+            "last_touch": _now,
+            "start": _now,
+        }
+
         while True:
             if is_interrupted():
                 try:
@@ -128,6 +145,13 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
                     pass
                 return self._timeout_result_for_modal(prepared.timeout)
 
+            # Periodic activity touch so the gateway knows we're alive
+            try:
+                from tools.environments.base import touch_activity_if_due
+                touch_activity_if_due(_activity_state, "modal command running")
+            except Exception:
+                pass
+
             time.sleep(self._poll_interval_seconds)
 
     def _before_execute(self) -> None:
@@ -142,8 +166,8 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
         timeout: int | None = None,
         stdin_data: str | None = None,
     ) -> PreparedModalExec:
-        effective_cwd = cwd or self.cwd
-        effective_timeout = timeout or self.timeout
+        effective_cwd = self._normalize_cwd(cwd)
+        effective_timeout = self._normalize_timeout(timeout)
 
         exec_command = command
         exec_stdin = stdin_data if self._stdin_mode == "payload" else None
@@ -160,6 +184,26 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
             timeout=effective_timeout,
             stdin_data=exec_stdin,
         )
+
+    def _normalize_cwd(self, cwd: str) -> str:
+        # strip() is only a blankness predicate; preserve nonblank cwd verbatim
+        # so leading/trailing whitespace remains a valid POSIX path component.
+        if isinstance(cwd, str) and cwd.strip():
+            return cwd
+        if isinstance(self.cwd, str) and self.cwd.strip():
+            return self.cwd
+        return "/root"
+
+    def _normalize_timeout(self, timeout: int | None) -> int:
+        candidate = self.timeout if timeout is None else timeout
+        try:
+            parsed = int(candidate)
+        except (TypeError, ValueError):
+            parsed = int(self.timeout) if isinstance(self.timeout, int) else 0
+        if parsed <= 0:
+            fallback = int(self.timeout) if isinstance(self.timeout, int) else 0
+            parsed = fallback if fallback > 0 else 60
+        return parsed
 
     def _result(self, output: str, returncode: int) -> dict:
         return {

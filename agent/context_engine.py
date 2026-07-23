@@ -28,6 +28,63 @@ Lifecycle:
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
+from agent.redact import redact_sensitive_text
+
+
+MEMORY_CONTEXT_MAX_CHARS = 6_000
+_MEMORY_CONTEXT_HEAD_CHARS = 4_000
+_MEMORY_CONTEXT_TAIL_CHARS = 1_500
+_MEMORY_CONTEXT_TRUNCATION_MARKER = "\n...[memory provider context truncated]...\n"
+
+
+def sanitize_memory_context(memory_context: str) -> str:
+    """Prepare provider context for a context-engine/LLM egress boundary."""
+    sanitized = redact_sensitive_text(
+        memory_context.strip(),
+        force=True,
+        redact_url_credentials=True,
+    )
+    if len(sanitized) <= MEMORY_CONTEXT_MAX_CHARS:
+        return sanitized
+    return (
+        sanitized[:_MEMORY_CONTEXT_HEAD_CHARS]
+        + _MEMORY_CONTEXT_TRUNCATION_MARKER
+        + sanitized[-_MEMORY_CONTEXT_TAIL_CHARS:]
+    )
+
+
+def automatic_compaction_status_message(
+    engine: Any,
+    *,
+    phase: str,
+    default_message: str,
+    **context: Any,
+) -> str | None:
+    """Resolve host-visible status for an automatic compaction event.
+
+    Engines can suppress routine automatic status with
+    ``emit_automatic_compaction_status = False`` or customize it by defining
+    ``get_automatic_compaction_status_message(...)``. Empty strings and
+    ``None`` mean "do not emit a lifecycle status".
+    """
+    if not getattr(engine, "emit_automatic_compaction_status", True):
+        return None
+
+    formatter = getattr(engine, "get_automatic_compaction_status_message", None)
+    if callable(formatter):
+        message = formatter(
+            phase=phase,
+            default_message=default_message,
+            **context,
+        )
+    else:
+        message = default_message
+
+    if message is None:
+        return None
+    message = str(message).strip()
+    return message or None
+
 
 class ContextEngine(ABC):
     """Base class all context engines must implement."""
@@ -55,10 +112,21 @@ class ContextEngine(ABC):
     # These control the preflight compression check.  Subclasses may
     # override via __init__ or property; defaults are sensible for most
     # engines.
+    #
+    # protect_first_n semantics (since PR #13754): count of non-system head
+    # messages always preserved verbatim, IN ADDITION to the system prompt
+    # which is always implicitly protected.  Default 3 keeps the
+    # historical "system + first 3 non-system messages" head shape.
 
     threshold_percent: float = 0.75
     protect_first_n: int = 3
     protect_last_n: int = 6
+
+    # User-visible lifecycle status for automatic host-triggered compaction.
+    # Alternative engines that treat compaction as routine background
+    # maintenance can set this false to keep successful automatic passes silent;
+    # warnings, errors, and explicit manual commands should still surface.
+    emit_automatic_compaction_status: bool = True
 
     # -- Core interface ----------------------------------------------------
 
@@ -66,18 +134,39 @@ class ContextEngine(ABC):
     def update_from_response(self, usage: Dict[str, Any]) -> None:
         """Update tracked token usage from an API response.
 
-        Called after every LLM call with the usage dict from the response.
+        Called after every LLM call with a normalized usage dict. The legacy
+        keys ``prompt_tokens``, ``completion_tokens``, and ``total_tokens``
+        are always present. Newer hosts also include canonical buckets:
+        ``input_tokens``, ``output_tokens``, ``cache_read_tokens``,
+        ``cache_write_tokens``, and ``reasoning_tokens``. Engines should
+        treat those fields as optional for compatibility with older hosts.
         """
 
     @abstractmethod
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Return True if compaction should fire this turn."""
 
+    def should_compress_info(self, prompt_tokens: int = None) -> "tuple[bool, str | None]":
+        """Return ``(should_compress, reason)``.
+
+        The base implementation is backward-compatible: engines that only
+        implement ``should_compress`` get ``(should_compress(prompt_tokens),
+        None)``. Concrete engines with richer block reasons (e.g. a
+        summary-LLM cooldown or an anti-thrashing guard) override this to
+        surface a human-readable reason so callers can warn the user instead
+        of silently skipping compression. Added for the silent-overflow
+        warning fix (#62625) so plugin engines don't raise AttributeError.
+        """
+        return self.should_compress(prompt_tokens), None
+
     @abstractmethod
     def compress(
         self,
         messages: List[Dict[str, Any]],
-        current_tokens: int = None,
+        current_tokens: Optional[int] = None,
+        focus_topic: Optional[str] = None,
+        force: bool = False,
+        memory_context: str = "",
     ) -> List[Dict[str, Any]]:
         """Compact the message list and return the new message list.
 
@@ -86,6 +175,18 @@ class ContextEngine(ABC):
         context budget. The implementation is free to summarize, build a
         DAG, or do anything else — as long as the returned list is a valid
         OpenAI-format message sequence.
+
+        Args:
+            focus_topic: Optional topic string from manual ``/compress <focus>``.
+                Engines that support guided compression should prioritise
+                preserving information related to this topic.  Engines that
+                don't support it may simply ignore this argument.
+            force: Whether a user-requested compression should bypass an
+                engine-owned cooldown. Engines without cooldowns may ignore it.
+            memory_context: Text returned by memory providers immediately before
+                compaction. Summarizing engines should include non-empty text in
+                their handoff prompt. Older engines may omit this parameter; the
+                host filters unsupported optional arguments by signature.
         """
 
     # -- Optional: pre-flight check ----------------------------------------
@@ -97,6 +198,51 @@ class ContextEngine(ABC):
         can do a cheap estimate.
         """
         return False
+
+    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
+        """Return True when preflight should trust recent real usage instead.
+
+        Built-in compression uses this to avoid re-compacting from known-noisy
+        rough estimates after a compressed request has already fit. Third-party
+        engines can ignore it safely.
+        """
+        return False
+
+    def get_automatic_compaction_status_message(
+        self,
+        *,
+        phase: str,
+        default_message: str,
+        **context: Any,
+    ) -> str | None:
+        """Return user-visible status for automatic host-triggered compaction.
+
+        Return ``None`` to suppress successful automatic lifecycle status for
+        this compaction event. ``phase`` identifies the host call site (for
+        example ``"preflight"`` or ``"compress"``). ``context`` contains
+        best-effort fields such as ``approx_tokens`` and ``threshold_tokens``.
+
+        This hook does not control warning/error messages or explicit manual
+        commands such as ``/compress``.
+        """
+        if not self.emit_automatic_compaction_status:
+            return None
+        return default_message
+
+    # -- Optional: manual /compress preflight ------------------------------
+
+    def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+        """Quick check: is there anything in ``messages`` that can be compacted?
+
+        Used by the gateway ``/compress`` command as a preflight guard —
+        returning False lets the gateway report "nothing to compress yet"
+        without making an LLM call.
+
+        Default returns True (always attempt).  Engines with a cheap way
+        to introspect their own head/tail boundaries should override this
+        to return False when the transcript is still entirely protected.
+        """
+        return True
 
     # -- Optional: session lifecycle ---------------------------------------
 
@@ -153,12 +299,17 @@ class ContextEngine(ABC):
 
         Default returns the standard fields run_agent.py expects.
         """
+        # Clamp the -1 "compression just ran, awaiting real usage" sentinel
+        # (set by conversation_compression) to 0 so status readers don't see a
+        # raw -1 or a negative usage_percent on the transitional turn. Mirrors
+        # the CLI/gateway status-bar paths (cli.py, tui_gateway/server.py).
+        last_prompt = self.last_prompt_tokens if self.last_prompt_tokens > 0 else 0
         return {
-            "last_prompt_tokens": self.last_prompt_tokens,
+            "last_prompt_tokens": last_prompt,
             "threshold_tokens": self.threshold_tokens,
             "context_length": self.context_length,
             "usage_percent": (
-                min(100, self.last_prompt_tokens / self.context_length * 100)
+                min(100, last_prompt / self.context_length * 100)
                 if self.context_length else 0
             ),
             "compression_count": self.compression_count,
@@ -173,6 +324,7 @@ class ContextEngine(ABC):
         base_url: str = "",
         api_key: str = "",
         provider: str = "",
+        api_mode: str = "",
     ) -> None:
         """Called when the user switches models or on fallback activation.
 
@@ -181,4 +333,19 @@ class ContextEngine(ABC):
         (e.g. recalculate DAG budgets, switch summary models).
         """
         self.context_length = context_length
+        # Apply per-model threshold overrides if set (longest substring match).
+        # Falls back to _config_threshold_percent (the raw config value) when
+        # no override matches. Plugin engines that override update_model() can
+        # call resolve_model_threshold() for the same logic.
+        from agent.context_compressor import resolve_model_threshold
+        if not hasattr(self, "_config_threshold_percent"):
+            # Snapshot the pre-override percent ONCE so repeated model
+            # switches fall back to the engine's configured value, not the
+            # previous model's override.
+            self._config_threshold_percent = self.threshold_percent
+        self._base_threshold_percent = resolve_model_threshold(
+            model, getattr(self, "model_thresholds", {}),
+            self._config_threshold_percent,
+        )
+        self.threshold_percent = self._base_threshold_percent
         self.threshold_tokens = int(context_length * self.threshold_percent)
